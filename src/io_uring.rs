@@ -373,16 +373,6 @@ pub async fn io_loop(
     #[allow(unused_variables)]
     let (client_handler, ev_tx) = spawn_ev_client_task().await;
 
-    // prepare/bind needed TCP listeners
-    info!("{} 🛰️ Starting TCP server for MD...", NAME);
-    let bind_addr = format!("0.0.0.0:{}", TCP_SERVER_PORT).parse().unwrap();
-    let mut md_listener = Some(TcpListener::bind(bind_addr).unwrap());
-    info!("{} 🛰️ MD TCP server bound to: <u>{}</u>", NAME, bind_addr);
-    info!("{} 🛰️ Starting TCP server for DHU...", NAME);
-    let bind_addr = format!("0.0.0.0:{}", TCP_DHU_PORT).parse().unwrap();
-    let mut dhu_listener = Some(TcpListener::bind(bind_addr).unwrap());
-    info!("{} 🛰️ DHU TCP server bound to: <u>{}</u>", NAME, bind_addr);
-
     // create media tap sinks once — they persist across reconnects (requires mitm=true)
     let persistent_media_sinks: HashMap<u8, MediaSink> = {
         let config_snapshot = config.read().await.clone();
@@ -421,6 +411,20 @@ pub async fn io_loop(
     loop {
         // reload new config
         let config = config.read().await.clone();
+
+        // Bind fresh TCP listeners each iteration so that stale io_uring state
+        // from a previous session's abort cannot prevent the next accept() from
+        // completing. This mirrors process-restart behaviour and is safe because
+        // the phone only attempts the TCP connection after the BT handshake
+        // (tcp_start notification), which happens after these binds.
+        info!("{} 🛰️ Starting TCP server for MD...", NAME);
+        let bind_addr = format!("0.0.0.0:{}", TCP_SERVER_PORT).parse().unwrap();
+        let mut md_listener = TcpListener::bind(bind_addr).unwrap();
+        info!("{} 🛰️ MD TCP server bound to: <u>{}</u>", NAME, bind_addr);
+        info!("{} 🛰️ Starting TCP server for DHU...", NAME);
+        let bind_addr = format!("0.0.0.0:{}", TCP_DHU_PORT).parse().unwrap();
+        let mut dhu_listener = TcpListener::bind(bind_addr).unwrap();
+        info!("{} 🛰️ DHU TCP server bound to: <u>{}</u>", NAME, bind_addr);
 
         // generate Durations from configured seconds
         let stats_interval = {
@@ -461,7 +465,7 @@ pub async fn io_loop(
                 "{} 🛰️ MD TCP server: listening for phone connection...",
                 NAME
             );
-            if let Ok((s, ip)) = tcp_wait_for_connection(&mut md_listener.as_mut().unwrap()).await {
+            if let Ok((s, ip)) = tcp_wait_for_connection(&mut md_listener).await {
                 md_tcp = Some(s);
                 // Get MAC address of the connected client for later disassociation
                 client_mac = mac_from_ipv4(ip).await.unwrap_or(None);
@@ -477,7 +481,7 @@ pub async fn io_loop(
                 "{} 🛰️ DHU TCP server: listening for `Desktop Head Unit` connection...",
                 NAME
             );
-            if let Ok((s, _)) = tcp_wait_for_connection(&mut dhu_listener.as_mut().unwrap()).await {
+            if let Ok((s, _)) = tcp_wait_for_connection(&mut dhu_listener).await {
                 hu_tcp = Some(s);
             } else {
                 // notify main loop to restart
