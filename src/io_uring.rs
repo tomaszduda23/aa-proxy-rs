@@ -48,7 +48,7 @@ const COMP_APP_TCP_PORT: u16 = 9999;
 const COMP_APP_TCP_PORT_WS: u16 = 9998;
 const COMP_APP_TCP_PORT_SWUPDATE: u16 = 9997;
 
-use crate::config::{Action, SharedConfig};
+use crate::config::{Action, RuntimeCfgRx, SharedConfig};
 use crate::config::{TCP_DHU_PORT, TCP_SERVER_PORT};
 use crate::ev::spawn_ev_client_task;
 use crate::ev::BatteryData;
@@ -367,6 +367,7 @@ pub async fn io_loop(
     last_speed: Arc<RwLock<Option<u32>>>,
     script_registry: Option<Arc<ScriptRegistry>>,
     ws_event_tx: BroadcastSender<ServerEvent>,
+    runtime_cfg_rx: RuntimeCfgRx,
 ) -> Result<()> {
     let shared_config = config.clone();
     #[allow(unused_variables)]
@@ -596,6 +597,7 @@ pub async fn io_loop(
             script_registry.clone(),
             HashMap::new(),
             ws_event_tx.clone(),
+            runtime_cfg_rx.clone(),
         ));
         from_stream = tokio_uring::spawn(proxy(
             ProxyType::MobileDevice,
@@ -614,6 +616,7 @@ pub async fn io_loop(
             script_registry.clone(),
             persistent_media_sinks.clone(),
             ws_event_tx.clone(),
+            runtime_cfg_rx.clone(),
         ));
 
         // Thread for monitoring transfer

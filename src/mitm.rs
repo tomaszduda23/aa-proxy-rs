@@ -50,7 +50,7 @@ use protobuf::text_format::print_to_string_pretty;
 use protobuf::{Enum, EnumOrUnknown, Message, MessageDyn};
 use protos::ControlMessageType::{self, *};
 
-use crate::config::{Action::Stop, AppConfig, SharedConfig};
+use crate::config::{Action::Stop, AppConfig, RuntimeCfgRx, RuntimeMitmConfig, SharedConfig};
 use crate::config_types::HexdumpLevel;
 use crate::ev::EvTaskCommand;
 use crate::io_uring::Endpoint;
@@ -404,7 +404,8 @@ pub async fn pkt_modify_hook(
     input_channel: Arc<tokio::sync::Mutex<Option<u8>>>,
     last_battery: Arc<RwLock<Option<BatteryData>>>,
     last_speed: Arc<RwLock<Option<u32>>>,
-    cfg: &AppConfig,
+    session_cfg: &AppConfig,
+    runtime_cfg: &RuntimeMitmConfig,
     config: &mut SharedConfig,
     script_registry: Option<&ScriptRegistry>,
     ws_event_tx: BroadcastSender<ServerEvent>,
@@ -414,7 +415,9 @@ pub async fn pkt_modify_hook(
         return Ok(false);
     }
 
-    if let Some(handled) = run_wasm_hooks(proxy_type, pkt, ctx, cfg, script_registry).await? {
+    if let Some(handled) =
+        run_wasm_hooks(proxy_type, pkt, ctx, session_cfg, script_registry).await?
+    {
         if handled {
             return Ok(true);
         }
@@ -432,7 +435,7 @@ pub async fn pkt_modify_hook(
                     if let Ok(mut msg) = SensorRequest::parse_from_bytes(data) {
                         if msg.type_() == SensorType::SENSOR_VEHICLE_ENERGY_MODEL_DATA {
                             // check if we have some battery logger configured
-                            if let Some(path) = &cfg.ev_battery_logger {
+                            if let Some(path) = &runtime_cfg.ev_battery_logger {
                                 debug!(
                                   "additional SENSOR_MESSAGE_REQUEST for {:?}, making a response with success...",
                                   msg.type_()
@@ -490,7 +493,7 @@ pub async fn pkt_modify_hook(
                 }
                 SENSOR_MESSAGE_BATCH => {
                     if let Ok(mut msg) = SensorBatch::parse_from_bytes(data) {
-                        if cfg.video_in_motion || cfg.disable_driving_status {
+                        if runtime_cfg.video_in_motion || runtime_cfg.disable_driving_status {
                             // === DRIVING STATUS: must be UNRESTRICTED (0) ===
                             // This is the primary flag AA checks. Value is a bitmask:
                             // 0 = unrestricted, 1 = no video, 2 = no keyboard, etc.
@@ -499,7 +502,7 @@ pub async fn pkt_modify_hook(
                             }
                         }
 
-                        if cfg.video_in_motion {
+                        if runtime_cfg.video_in_motion {
                             // === GEAR: force PARK ===
                             if !msg.gear_data.is_empty() {
                                 msg.gear_data[0].set_gear(GEAR_PARK);
@@ -578,7 +581,7 @@ pub async fn pkt_modify_hook(
                             pkt.payload.insert(1, (message_id & 0xff) as u8);
                         }
 
-                        if cfg.collect_speed {
+                        if runtime_cfg.collect_speed {
                             if !msg.speed_data.is_empty() {
                                 *last_speed.write().await =
                                     Some(msg.speed_data[0].speed_e3().try_into().unwrap());
@@ -589,7 +592,7 @@ pub async fn pkt_modify_hook(
                             }
                         }
 
-                        if cfg.odometer {
+                        if runtime_cfg.odometer {
                             if !msg.odometer_data.is_empty() {
                                 let od_json = serde_json::json!({
                                     "kms": msg.odometer_data[0].kms_e1(),
@@ -610,7 +613,9 @@ pub async fn pkt_modify_hook(
                         // The HU sends SENSOR_FUEL data in response to our earlier
                         // SENSOR_MESSAGE_REQUEST
                         // We use the SoC to populate the EV model for MD/Android
-                        if cfg.ev && proxy_type == ProxyType::HeadUnit && !msg.fuel_data.is_empty()
+                        if runtime_cfg.ev
+                            && proxy_type == ProxyType::HeadUnit
+                            && !msg.fuel_data.is_empty()
                         {
                             let soc = msg.fuel_data[0].fuel_level();
                             info!(
@@ -678,7 +683,7 @@ pub async fn pkt_modify_hook(
     }
 
     // if configured, override max_unacked for matching audio channels
-    if cfg.audio_max_unacked > 0
+    if runtime_cfg.audio_max_unacked > 0
         && ctx.audio_channels.contains(&pkt.channel)
         && proxy_type == ProxyType::HeadUnit
     {
@@ -688,14 +693,14 @@ pub async fn pkt_modify_hook(
                     // get previous/original value
                     let prev_val = msg.max_unacked();
                     // set new value
-                    msg.set_max_unacked(cfg.audio_max_unacked.into());
+                    msg.set_max_unacked(runtime_cfg.audio_max_unacked.into());
 
                     info!(
                         "{} <yellow>{:?}</>: overriding max audio unacked from <b>{}</> to <b>{}</> for channel: <b>{:#04x}</>",
                         get_name(proxy_type),
                         m,
                         prev_val,
-                        cfg.audio_max_unacked,
+                        runtime_cfg.audio_max_unacked,
                         pkt.channel,
                     );
 
@@ -738,7 +743,7 @@ pub async fn pkt_modify_hook(
     // parsing data
     match control.unwrap_or(MESSAGE_UNEXPECTED_MESSAGE) {
         MESSAGE_BYEBYE_REQUEST => {
-            if cfg.stop_on_disconnect && proxy_type == ProxyType::MobileDevice {
+            if runtime_cfg.stop_on_disconnect && proxy_type == ProxyType::MobileDevice {
                 if let Ok(msg) = ByeByeRequest::parse_from_bytes(data) {
                     if msg.reason.unwrap_or_default() == USER_SELECTION.into() {
                         info!(
@@ -841,7 +846,7 @@ pub async fn pkt_modify_hook(
             }
 
             // DPI
-            if cfg.dpi > 0 {
+            if session_cfg.dpi > 0 {
                 if let Some(svc) = msg
                     .services
                     .iter_mut()
@@ -851,19 +856,19 @@ pub async fn pkt_modify_hook(
                     let prev_val = svc.media_sink_service.video_configs[0].density();
                     // set new value
                     svc.media_sink_service.as_mut().unwrap().video_configs[0]
-                        .set_density(cfg.dpi.into());
+                        .set_density(session_cfg.dpi.into());
                     info!(
                         "{} <yellow>{:?}</>: replacing DPI value: from <b>{}</> to <b>{}</>",
                         get_name(proxy_type),
                         control.unwrap(),
                         prev_val,
-                        cfg.dpi
+                        session_cfg.dpi
                     );
                 }
             }
 
             // disable tts sink
-            if cfg.disable_tts_sink {
+            if session_cfg.disable_tts_sink {
                 while let Some(svc) = msg.services.iter_mut().find(|svc| {
                     !svc.media_sink_service.audio_configs.is_empty()
                         && svc.media_sink_service.audio_type() == AUDIO_STREAM_GUIDANCE
@@ -881,7 +886,7 @@ pub async fn pkt_modify_hook(
             }
 
             // disable media sink
-            if cfg.disable_media_sink {
+            if session_cfg.disable_media_sink {
                 msg.services
                     .retain(|svc| svc.media_sink_service.audio_type() != AUDIO_STREAM_MEDIA);
                 info!(
@@ -892,7 +897,7 @@ pub async fn pkt_modify_hook(
             }
 
             // save all audio sink channels in context
-            if cfg.audio_max_unacked > 0 {
+            if session_cfg.audio_max_unacked > 0 {
                 for svc in msg
                     .services
                     .iter()
@@ -908,11 +913,11 @@ pub async fn pkt_modify_hook(
             }
 
             // save sensor channel in context
-            if cfg.ev
-                || cfg.video_in_motion
-                || cfg.odometer
-                || cfg.collect_speed
-                || cfg.tire_pressure
+            if session_cfg.ev
+                || session_cfg.video_in_motion
+                || session_cfg.odometer
+                || session_cfg.collect_speed
+                || session_cfg.tire_pressure
             {
                 if let Some(svc) = msg
                     .services
@@ -950,7 +955,7 @@ pub async fn pkt_modify_hook(
             }
 
             // save navigation channel in context
-            if cfg.waze_lht_workaround {
+            if session_cfg.waze_lht_workaround {
                 if let Some(svc) = msg
                     .services
                     .iter()
@@ -968,7 +973,7 @@ pub async fn pkt_modify_hook(
             }
 
             // remove tap restriction by removing SENSOR_SPEED
-            if cfg.remove_tap_restriction && !cfg.collect_speed {
+            if session_cfg.remove_tap_restriction && !session_cfg.collect_speed {
                 if let Some(svc) = msg
                     .services
                     .iter_mut()
@@ -984,7 +989,7 @@ pub async fn pkt_modify_hook(
 
             // video_in_motion: strip motion-related sensors from SDR capabilities
             // and downgrade location_characterization so AA cannot cross-validate
-            if cfg.video_in_motion {
+            if session_cfg.video_in_motion {
                 if let Some(svc) = msg
                     .services
                     .iter_mut()
@@ -1023,7 +1028,7 @@ pub async fn pkt_modify_hook(
             }
 
             // enabling developer mode
-            if cfg.developer_mode {
+            if session_cfg.developer_mode {
                 msg.set_make(DHU_MAKE.into());
                 msg.set_model(DHU_MODEL.into());
                 msg.set_head_unit_make(DHU_MAKE.into());
@@ -1041,17 +1046,17 @@ pub async fn pkt_modify_hook(
                 );
             }
 
-            if cfg.remove_bluetooth {
+            if session_cfg.remove_bluetooth {
                 msg.services.retain(|svc| svc.bluetooth_service.is_none());
             }
 
-            if cfg.remove_wifi {
+            if session_cfg.remove_wifi {
                 msg.services
                     .retain(|svc| svc.wifi_projection_service.is_none());
             }
 
             // EV routing features
-            if cfg.ev {
+            if session_cfg.ev {
                 if let Some(svc) = msg
                     .services
                     .iter_mut()
@@ -1080,7 +1085,7 @@ pub async fn pkt_modify_hook(
 
                     // supported connector types
                     let connectors: Vec<EnumOrUnknown<EvConnectorType>> =
-                        match &cfg.ev_connector_types.0 {
+                        match &session_cfg.ev_connector_types.0 {
                             Some(types) => types.iter().map(|&t| t.into()).collect(),
                             None => {
                                 vec![EvConnectorType::EV_CONNECTOR_TYPE_MENNEKES.into()]
@@ -1100,7 +1105,7 @@ pub async fn pkt_modify_hook(
             }
 
             // Odometer sensor
-            if cfg.odometer {
+            if session_cfg.odometer {
                 if let Some(svc) = msg
                     .services
                     .iter_mut()
@@ -1122,7 +1127,7 @@ pub async fn pkt_modify_hook(
             }
 
             // Tire pressure sensor
-            if cfg.tire_pressure {
+            if session_cfg.tire_pressure {
                 if let Some(svc) = msg
                     .services
                     .iter_mut()
@@ -1553,10 +1558,11 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
     script_registry: Option<Arc<ScriptRegistry>>,
     media_sinks: HashMap<u8, MediaSink>,
     ws_event_tx: BroadcastSender<ServerEvent>,
+    runtime_cfg_rx: RuntimeCfgRx,
 ) -> Result<()> {
-    let cfg = config.read().await.clone();
-    let passthrough = !cfg.mitm;
-    let hex_requested = cfg.hexdump_level;
+    let session_cfg = config.read().await.clone();
+    let passthrough = !session_cfg.mitm;
+    let hex_requested = session_cfg.hexdump_level;
 
     // in full_frames/passthrough mode we only directly pass packets from one endpoint to the other
     if passthrough {
@@ -1714,6 +1720,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         tokio::select! {
         // handling data from opposite device's thread, which needs to be transmitted
         Some(mut pkt) = rx.recv() => {
+            let runtime_cfg = runtime_cfg_rx.borrow().clone();
             let handled = pkt_modify_hook(
                 proxy_type,
                 &mut pkt,
@@ -1723,7 +1730,8 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 input_channel.clone(),
                 last_battery.clone(),
                 last_speed.clone(),
-                &cfg,
+                &session_cfg,
+                &runtime_cfg,
                 &mut config,
                 script_registry.as_deref(),
                 ws_event_tx.clone()
@@ -1761,6 +1769,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
             let _ = pkt_debug(proxy_type, HexdumpLevel::RawInput, hex_requested, &pkt).await;
             match pkt.decrypt_payload(&mut mem_buf, &mut server).await {
                 Ok(_) => {
+                    let runtime_cfg = runtime_cfg_rx.borrow().clone();
                     let _ = pkt_modify_hook(
                         proxy_type,
                         &mut pkt,
@@ -1770,7 +1779,8 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         input_channel.clone(),
                         last_battery.clone(),
                         last_speed.clone(),
-                        &cfg,
+                        &session_cfg,
+                        &runtime_cfg,
                         &mut config,
                         script_registry.as_deref(),
                         ws_event_tx.clone(),

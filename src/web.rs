@@ -1,6 +1,8 @@
 use crate::config::Action;
 use crate::config::AppConfig;
 use crate::config::ConfigJson;
+use crate::config::RuntimeCfgTx;
+use crate::config::RuntimeMitmConfig;
 use crate::config::SharedConfig;
 use crate::config::SharedConfigJson;
 use crate::ev::send_ev_data;
@@ -127,6 +129,8 @@ pub struct AppState {
     pub last_tire_pressure_data: Arc<RwLock<Option<TirePressureData>>>,
     pub ws_event_tx: broadcast::Sender<ServerEvent>,
     pub script_registry: Option<Arc<ScriptRegistry>>,
+    /// Watch channel sender — push updated RuntimeMitmConfig whenever config changes.
+    pub runtime_cfg_tx: Arc<RuntimeCfgTx>,
 }
 
 pub fn app(state: Arc<AppState>) -> Router {
@@ -1100,6 +1104,8 @@ async fn update_config_entry(
     match AppConfig::load(config_path) {
         Ok(new_cfg) => {
             *cfg = new_cfg;
+            // Propagate runtime-hot fields to the proxy packet loop immediately.
+            let _ = state.runtime_cfg_tx.send(RuntimeMitmConfig::from(&*cfg));
             info!(
                 "{} Config entry updated: {} = {}",
                 NAME, entry.key, entry.value
@@ -1136,6 +1142,8 @@ async fn set_config(
         let mut cfg = state.config.write().await;
         *cfg = new_cfg.clone();
         cfg.save((&state.config_file).to_path_buf());
+        // Propagate runtime-hot fields to the proxy packet loop immediately.
+        let _ = state.runtime_cfg_tx.send(RuntimeMitmConfig::from(&*cfg));
     }
     Json(new_cfg)
 }

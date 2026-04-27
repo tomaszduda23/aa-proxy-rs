@@ -4,6 +4,7 @@ use aa_proxy_rs::config::SharedConfig;
 use aa_proxy_rs::config::SharedConfigJson;
 use aa_proxy_rs::config::WifiConfig;
 use aa_proxy_rs::config::{Action, AppConfig};
+use aa_proxy_rs::config::{RuntimeCfgTx, RuntimeMitmConfig};
 use aa_proxy_rs::config::{DEFAULT_WLAN_ADDR, TCP_SERVER_PORT};
 use aa_proxy_rs::ev::BatteryData;
 use aa_proxy_rs::io_uring::io_loop;
@@ -216,6 +217,7 @@ async fn tokio_main(
     profile_connected: Arc<AtomicBool>,
     ws_event_tx: broadcast::Sender<ServerEvent>,
     script_registry: Option<Arc<ScriptRegistry>>,
+    runtime_cfg_tx: Arc<RuntimeCfgTx>,
 ) -> Result<()> {
     let accessory_started = Arc::new(Notify::new());
     let accessory_started_cloned = accessory_started.clone();
@@ -232,6 +234,7 @@ async fn tokio_main(
         last_tire_pressure_data,
         ws_event_tx,
         script_registry,
+        runtime_cfg_tx,
     };
 
     // LED support
@@ -618,6 +621,14 @@ fn main() -> Result<()> {
     let (ws_event_tx, _ws_event_rx) = broadcast::channel(256);
     let ws_event_tx_cloned = ws_event_tx.clone();
 
+    // Watch channel for hot-reloadable runtime MITM config (packet-level options).
+    // web handlers send updates here; proxy tasks read via cheap borrow() — no async overhead.
+    let initial_runtime_cfg = RuntimeMitmConfig::from(&*config.blocking_read());
+    let (runtime_cfg_tx, runtime_cfg_rx) = tokio::sync::watch::channel(initial_runtime_cfg);
+    let runtime_cfg_tx = Arc::new(runtime_cfg_tx);
+    let runtime_cfg_tx_cloned = runtime_cfg_tx.clone();
+    let runtime_cfg_rx_cloned = runtime_cfg_rx.clone();
+
     // build and spawn main tokio runtime
     let mut runtime = Builder::new_multi_thread().enable_all().build().unwrap();
     let restart_tx_cloned = restart_tx.clone();
@@ -653,6 +664,7 @@ fn main() -> Result<()> {
             profile_connected_cloned,
             ws_event_tx_cloned,
             script_registry_cloned,
+            runtime_cfg_tx_cloned,
         )
         .await
     });
@@ -669,6 +681,7 @@ fn main() -> Result<()> {
         last_speed,
         script_registry.clone(),
         ws_event_tx.clone(),
+        runtime_cfg_rx_cloned,
     ));
 
     info!(

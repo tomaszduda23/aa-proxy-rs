@@ -153,6 +153,41 @@ pub struct AppConfig {
     pub action_requested: Option<Action>,
 }
 
+/// Subset of AppConfig fields that can be changed on the fly during an active AA session.
+/// These are all packet-level options that do NOT require SDR/channel-discovery to take effect.
+/// Updated via a tokio::sync::watch channel so the packet loop reads them with zero async overhead.
+#[derive(Debug, Clone)]
+pub struct RuntimeMitmConfig {
+    pub video_in_motion: bool,
+    pub disable_driving_status: bool,
+    pub collect_speed: bool,
+    pub odometer: bool,
+    pub ev: bool,
+    pub ev_battery_logger: Option<String>,
+    pub audio_max_unacked: u8,
+    pub stop_on_disconnect: bool,
+}
+
+impl From<&AppConfig> for RuntimeMitmConfig {
+    fn from(cfg: &AppConfig) -> Self {
+        Self {
+            video_in_motion: cfg.video_in_motion,
+            disable_driving_status: cfg.disable_driving_status,
+            collect_speed: cfg.collect_speed,
+            odometer: cfg.odometer,
+            ev: cfg.ev,
+            ev_battery_logger: cfg.ev_battery_logger.clone(),
+            audio_max_unacked: cfg.audio_max_unacked,
+            stop_on_disconnect: cfg.stop_on_disconnect,
+        }
+    }
+}
+
+/// Sender half of the watch channel used to push RuntimeMitmConfig updates to proxy tasks.
+pub type RuntimeCfgTx = tokio::sync::watch::Sender<RuntimeMitmConfig>;
+/// Receiver half — cloned into each proxy task for zero-cost reads.
+pub type RuntimeCfgRx = tokio::sync::watch::Receiver<RuntimeMitmConfig>;
+
 impl Default for ConfigValue {
     fn default() -> Self {
         Self {
